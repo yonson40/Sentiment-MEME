@@ -1,0 +1,247 @@
+import requests
+import json
+import pandas as pd
+from datetime import datetime, timedelta
+import os
+from dotenv import load_dotenv
+import logging
+import time
+
+# Set up logging with a proper format
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Add file handler for debugging
+debug_handler = logging.FileHandler('debug.log')
+debug_handler.setLevel(logging.DEBUG)
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+debug_handler.setFormatter(formatter)
+logger.addHandler(debug_handler)
+
+# Load environment variables
+load_dotenv()
+
+class BitqueryClient:
+    def __init__(self):
+        self.token = os.getenv('BITQUERY_TOKEN')
+        if not self.token:
+            raise ValueError("Token is required. Please set BITQUERY_TOKEN in your .env file")
+        
+        self.eap_endpoint = "https://streaming.bitquery.io/eap"
+        self.headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.token}"
+        }
+    
+    def fetch_ohlcv_data(self, token_address, base_address, symbol=None, interval_seconds=5, time_ago=None):
+        """
+        Fetch OHLCV (Open, High, Low, Close, Volume) data for a token pair
+        """
+        if time_ago is None:
+            # Format time in RFC3339 format
+            time_ago = (datetime.utcnow() - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        
+        query = """
+        query ($token: String!, $base: String!, $time_ago: DateTime!, $interval: Int!) {
+          Solana {
+            DEXTradeByTokens(
+              orderBy: {ascendingByField: "Block_Time"}
+              where: {
+                Trade: {
+                  Side: {
+                    Amount: {gt: "0"}, 
+                    Currency: {
+                      MintAddress: {is: $token}
+                    }
+                  }, 
+                  Currency: {
+                    MintAddress: {is: $base}
+                  }
+                }, 
+                Block: {
+                  Time: {after: $time_ago}
+                }
+              }
+            ) {
+              Block {
+                Time(interval: {count: $interval, in: seconds})
+              }
+              min: quantile(of: Trade_PriceInUSD, level: 0.05)
+              max: quantile(of: Trade_PriceInUSD, level: 0.95)
+              close: median(of: Trade_PriceInUSD)
+              open: median(of: Trade_PriceInUSD)
+              volume: sum(of: Trade_Side_AmountInUSD)
+            }
+          }
+        }
+        """
+        
+        variables = {
+            "base": base_address,
+            "token": token_address,
+            "interval": interval_seconds,
+            "time_ago": time_ago
+        }
+        
+        try:
+            # Prepare the request payload
+            payload = {
+                "query": query,
+                "variables": variables
+            }
+            
+            if symbol:
+                logger.info("Fetching data for %s...", symbol)
+            else:
+                logger.info("Fetching data for %s...", token_address)
+            logger.debug("Sending request with payload: %s", json.dumps(payload, indent=2))
+            
+            response = requests.post(
+                self.eap_endpoint,
+                headers=self.headers,
+                json=payload
+            )
+            
+            # Log the raw response for debugging
+            if symbol:
+                logger.debug("Raw response for %s: %s", symbol, response.text)
+            else:
+                logger.debug("Raw response for %s: %s", token_address, response.text)
+            
+            response.raise_for_status()
+            data = response.json()
+            
+            if not isinstance(data, dict):
+                if symbol:
+                    logger.error("Unexpected response format for %s. Expected dict, got %s", symbol, type(data))
+                else:
+                    logger.error("Unexpected response format for %s. Expected dict, got %s", token_address, type(data))
+                return None
+                
+            if 'data' not in data:
+                if 'errors' in data:
+                    if symbol:
+                        logger.error("GraphQL errors for %s: %s", symbol, json.dumps(data['errors'], indent=2))
+                    else:
+                        logger.error("GraphQL errors for %s: %s", token_address, json.dumps(data['errors'], indent=2))
+                else:
+                    if symbol:
+                        logger.error("No 'data' field in response for %s: %s", symbol, data)
+                    else:
+                        logger.error("No 'data' field in response for %s: %s", token_address, data)
+                return None
+                
+            if 'Solana' not in data['data']:
+                if symbol:
+                    logger.error("No 'Solana' field in response data for %s: %s", symbol, data['data'])
+                else:
+                    logger.error("No 'Solana' field in response data for %s: %s", token_address, data['data'])
+                return None
+                
+            if 'DEXTradeByTokens' not in data['data']['Solana']:
+                if symbol:
+                    logger.error("No 'DEXTradeByTokens' field in Solana data for %s: %s", symbol, data['data']['Solana'])
+                else:
+                    logger.error("No 'DEXTradeByTokens' field in Solana data for %s: %s", token_address, data['data']['Solana'])
+                return None
+            
+            trades = data['data']['Solana']['DEXTradeByTokens']
+            
+            if not trades:
+                if symbol:
+                    logger.warning("No trades found for %s in the specified time period. Token address: %s", symbol, token_address)
+                else:
+                    logger.warning("No trades found for %s in the specified time period. Token address: %s", token_address, token_address)
+                return None
+            
+            # Log the first few trades for debugging
+            if trades:
+                if symbol:
+                    logger.debug("First trade for %s: %s", symbol, json.dumps(trades[0], indent=2))
+                else:
+                    logger.debug("First trade for %s: %s", token_address, json.dumps(trades[0], indent=2))
+            
+            df = pd.DataFrame(trades)
+            
+            # Process the nested Block.Time field
+            df['timestamp'] = df['Block'].apply(lambda x: x['Time'])
+            df = df.drop('Block', axis=1)
+            
+            # Convert timestamp to datetime
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            
+            # Set timestamp as index
+            df.set_index('timestamp', inplace=True)
+            
+            # Check for zero values
+            if (df[['close', 'max', 'min', 'open', 'volume']] == 0).all().all():
+                if symbol:
+                    logger.warning("All values are zero for %s. This might indicate an issue with the data.", symbol)
+                else:
+                    logger.warning("All values are zero for %s. This might indicate an issue with the data.", token_address)
+            
+            return df
+            
+        except requests.exceptions.RequestException as e:
+            if symbol:
+                logger.error("Request error for %s: %s", symbol, str(e))
+            else:
+                logger.error("Request error for %s: %s", token_address, str(e))
+            if hasattr(e, 'response') and e.response is not None:
+                if symbol:
+                    logger.error("Response status code: %s", e.response.status_code)
+                    logger.error("Response content: %s", e.response.text)
+                else:
+                    logger.error("Response status code: %s", e.response.status_code)
+                    logger.error("Response content: %s", e.response.text)
+            return None
+        except Exception as e:
+            if symbol:
+                logger.error("Unexpected error for %s: %s", symbol, str(e))
+            else:
+                logger.error("Unexpected error for %s: %s", token_address, str(e))
+            return None
+
+def main():
+    # Load tokens from cleaned_tokens.csv
+    df = pd.read_csv('../cleaned_tokens.csv')
+    
+    # Convert to dictionary with Symbol as key and MintAddress as value
+    tokens = {}
+    for _, row in df.iterrows():
+        # Remove '$' from symbol if present
+        symbol = row['Symbol'].replace('$', '')
+        tokens[symbol] = row['MintAddress']
+    
+    # Create BitqueryClient instance
+    client = BitqueryClient()
+    
+    # Process each token
+    for token_name, token_address in tokens.items():
+        try:
+            print(f"Processing {token_name}...")
+            
+            # Fetch data
+            df = client.fetch_ohlcv_data(
+                token_address=token_address,
+                base_address="So11111111111111111111111111111111111111112",  # Wrapped SOL address
+                symbol=token_name
+            )
+            
+            if df is not None:
+                # Save to CSV
+                filename = f"{token_name}_data.csv"
+                df.to_csv(filename)
+                print(f"Data saved to {filename}")
+            else:
+                print(f"No data available for {token_name}")
+                
+        except Exception as e:
+            print(f"Error processing {token_name}: {str(e)}")
+            continue
+
+if __name__ == "__main__":
+    main()
