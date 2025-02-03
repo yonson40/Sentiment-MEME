@@ -1,0 +1,46 @@
+{
+    "project": {
+      "id": "sentiment-meme-01H9KZ3",
+      "version": "2.3.1",
+      "sharing": {
+        "enabled": true,
+        "protocol": "windsync-v3",
+        "permissions": {
+          "read": [
+            {
+              "email": "team@domain.com",
+              "devices": ["mac-mini-m4", "aws-gpu-cluster"],
+              "expires": "2025-12-31"
+            }
+          ],
+          "write": [
+            {
+              "email": "jeremy@domain.com",
+              "devices": ["macbook-pro-2024", "mac-mini-m4"],
+              "restrictions": {
+                "paths": ["/agents/*", "/config/*"],
+                "hours": "09:00-17:00"
+              }
+            }
+          ]
+        },
+        "sync": {
+          "interval": 300,
+          "conflict_resolution": "timestamp",
+          "strategies": {
+            "code": "merge",
+            "data": "overwrite",
+            "env": "preserve"
+          },
+          "encryption": {
+            "algorithm": "aes-256-gcm",
+            "key_rotation": 86400
+          }
+        },
+        "devices": {
+          "primary": "macbook-pro-2024",
+          "secondaries": ["mac-mini-m4"]
+        }
+      }
+    }
+  }

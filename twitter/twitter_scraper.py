@@ -37,7 +37,6 @@ class TwitterScraper:
     def setup_driver(self):
         """Set up Chrome driver with appropriate options"""
         chrome_options = Options()
-        chrome_options.add_argument('--headless')
         chrome_options.add_argument('--no-sandbox')
         chrome_options.add_argument('--disable-dev-shm-usage')
         chrome_options.add_argument('--disable-gpu')
@@ -67,6 +66,16 @@ class TwitterScraper:
         self.driver.execute_cdp_cmd('Network.setUserAgentOverride', {"userAgent": 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'})
         self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         
+        # Add persistent element for visibility check
+        self.driver.execute_script("document.body.innerHTML += '<div id=\"scraperActive\" style=\"display:none;\">ACTIVE</div>'")
+        
+    def check_browser_visible(self):
+        """Verify browser window is actually open"""
+        try:
+            return self.driver.find_element(By.ID, "scraperActive").is_displayed()
+        except:
+            return False
+            
     def get_sentiment(self, text):
         """Analyze sentiment of text using TextBlob"""
         try:
@@ -83,41 +92,42 @@ class TwitterScraper:
             time.sleep(random.uniform(1, 2))  # Random delay between scrolls
             
     def extract_tweet_data(self, tweet_element):
-        """Extract data from a tweet element"""
+        """Extract structured data from tweet HTML"""
         try:
-            # Find tweet text
-            text_element = tweet_element.find_element(By.CSS_SELECTOR, '[data-testid="tweetText"]')
-            text = text_element.text
+            # Get raw HTML first
+            raw_html = tweet_element.get_attribute('outerHTML')
             
-            # Get timestamp
-            time_element = tweet_element.find_element(By.CSS_SELECTOR, 'time')
-            timestamp = time_element.get_attribute('datetime')
-            
-            # Get metrics (likes, retweets)
-            metrics = tweet_element.find_elements(By.CSS_SELECTOR, '[data-testid$="-count"]')
-            likes = retweets = 0
-            
-            for metric in metrics:
-                metric_id = metric.get_attribute('data-testid')
-                value = int(metric.text or 0)
-                if 'like' in metric_id:
-                    likes = value
-                elif 'retweet' in metric_id:
-                    retweets = value
-                    
-            # Get username
+            # Extract individual components
+            timestamp = tweet_element.find_element(By.CSS_SELECTOR, 'time').get_attribute('datetime')
             username = tweet_element.find_element(By.CSS_SELECTOR, '[data-testid="User-Name"]').text.split('\n')[0]
+            text = tweet_element.find_element(By.CSS_SELECTOR, '[data-testid="tweetText"]').text
             
-            # Calculate sentiment
-            sentiment = self.get_sentiment(text)
+            # Get engagement metrics
+            metrics = {
+                'likes': 0,
+                'retweets': 0,
+                'replies': 0
+            }
             
+            # Extract metrics from buttons
+            buttons = tweet_element.find_elements(By.CSS_SELECTOR, '[role="button"]')
+            for btn in buttons:
+                aria_label = btn.get_attribute('aria-label').lower()
+                if 'reply' in aria_label:
+                    metrics['replies'] = int(btn.text) if btn.text else 0
+                elif 'like' in aria_label:
+                    metrics['likes'] = int(btn.text) if btn.text else 0
+                elif 'retweet' in aria_label:
+                    metrics['retweets'] = int(btn.text) if btn.text else 0
+
             return {
                 'timestamp': timestamp,
-                'text': text,
                 'username': username,
-                'likes': likes,
-                'retweets': retweets,
-                'sentiment': sentiment
+                'text': text,
+                'likes': metrics['likes'],
+                'retweets': metrics['retweets'],
+                'replies': metrics['replies'],
+                'raw_html': raw_html
             }
             
         except Exception as e:
@@ -235,127 +245,264 @@ class TwitterScraper:
             logger.info(f"Rate limit detected. Waiting {wait_time:.2f} seconds")
             time.sleep(wait_time)
             
-    def scrape_tweets(self, query, days_back=1, limit=100):
-        """
-        Scrape tweets for a given query using Selenium with improved handling
-        """
-        tweets_list = []
-        retry_count = 0
-        
+    def scrape_tweets(self, query, days_back=365, limit=50000):
         try:
-            logger.info(f"Starting tweet scraping for query: {query}")
-            
-            # Login first
-            if not self.login_to_twitter():
-                logger.error("Failed to login to Twitter")
-                return pd.DataFrame()
-                
-            # Add meme-related keywords to the query
-            meme_keywords = ['meme', 'viral', 'trending', 'funny', 'lol', 'wojak', 'pepe']
-            enhanced_query = f"{query} OR ({query} ({' OR '.join(meme_keywords)}))"
-            logger.info(f"Enhanced query: {enhanced_query}")
-            
-            # Construct search URL with advanced filters
-            search_url = f"https://twitter.com/search?q={enhanced_query}%20lang%3Aen&src=typed_query&f=live"
-            logger.info(f"Search URL: {search_url}")
-            
+            search_url = self._build_search_url(query, days_back)
             self.driver.get(search_url)
-            logger.info("Loaded search page")
-            time.sleep(random.uniform(2, 4))
             
-            try:
-                # Wait for tweets to load
-                wait = WebDriverWait(self.driver, 10)
-                tweet_elements = wait.until(
-                    EC.presence_of_all_elements_located((By.CSS_SELECTOR, '[data-testid="tweet"]'))
-                )
-                logger.info(f"Found {len(tweet_elements)} initial tweets")
-            except Exception as e:
-                logger.error(f"Error waiting for tweets: {str(e)}")
-                logger.info(f"Page source: {self.driver.page_source[:500]}...")  # Log first 500 chars of page source
-                return pd.DataFrame()
+            tweets = []
+            scroll_attempts = 0
+            max_attempts = 1000
+            batch_size = 200
             
-            last_height = self.driver.execute_script("return document.body.scrollHeight")
-            logger.info(f"Initial page height: {last_height}")
-            
-            while len(tweets_list) < limit:
-                self.handle_rate_limit()
-                
-                # Find all tweets on the page
-                tweet_elements = self.driver.find_elements(By.CSS_SELECTOR, '[data-testid="tweet"]')
-                logger.info(f"Found {len(tweet_elements)} tweets on page")
-                
-                # Process new tweets
-                for tweet in tweet_elements:
-                    if len(tweets_list) >= limit:
-                        break
-                        
-                    tweet_data = self.extract_tweet_data(tweet)
-                    if tweet_data:
-                        # Add meme detection
-                        tweet_data['is_meme'] = any(keyword in tweet_data['text'].lower() for keyword in meme_keywords)
-                        tweets_list.append(tweet_data)
-                        self.tweets_scraped += 1
-                        logger.info(f"Processed tweet {len(tweets_list)}/{limit}")
-                        
-                # Scroll with dynamic wait
-                self.scroll_page(1)
-                logger.info("Scrolled page")
-                
-                # Check if we've reached the bottom
-                new_height = self.driver.execute_script("return document.body.scrollHeight")
-                logger.info(f"New page height: {new_height}")
-                
-                if new_height == last_height:
-                    retry_count += 1
-                    logger.info(f"No new content loaded, retry {retry_count}/3")
-                    if retry_count > 3:
-                        logger.info("Reached end of available tweets")
-                        break
-                else:
-                    retry_count = 0
-                    last_height = new_height
-                    
-                # Add random delay
-                delay = random.uniform(1, 3)
-                logger.info(f"Waiting {delay:.2f} seconds")
-                time.sleep(delay)
-                
-            logger.info(f"Collected {len(tweets_list)} tweets")
-            df = pd.DataFrame(tweets_list)
-            
-            # Add additional sentiment analysis for meme context
-            if not df.empty:
-                df['meme_relevance_score'] = df.apply(lambda row: 
-                    row['sentiment'] * (2 if row['is_meme'] else 1) * 
-                    (1 + (row['likes'] + row['retweets']) / 1000), axis=1)
-                logger.info("Added meme relevance scores")
-                
-            return df
-            
+            while len(tweets) < limit and scroll_attempts < max_attempts:
+                if self._handle_rate_limits():
+                    scroll_attempts += 10
+                    continue
+                new_tweets = self._harvest_tweets(batch_size)
+                tweets.extend(new_tweets)
+                if len(tweets) % 1000 == 0:
+                    logger.info(f"Collected {len(tweets)}/{limit} tweets")
+                    self._save_checkpoint(tweets)
+                self._smart_scroll()
+                scroll_attempts += 1
+                current_speed = len(tweets) / (scroll_attempts + 1)
+                if current_speed < 5:
+                    self._slow_down_scraping()
+            return pd.DataFrame(tweets[:limit])
         except Exception as e:
-            logger.error(f"Error scraping tweets: {str(e)}")
-            logger.error(f"Stack trace: {traceback.format_exc()}")
+            logger.error(f"Scraping failed: {str(e)}")
             return pd.DataFrame()
             
-    def save_tweets(self, df, token_name):
-        """Save tweets to CSV file"""
+    def _build_search_url(self, query, days_back):
+        return f"https://twitter.com/search?q={query} min_replies:100 min_faves:5000 since:{self._get_past_date(days_back)}"
+        
+    def _get_past_date(self, days_back):
+        past_date = datetime.now() - timedelta(days=days_back)
+        return past_date.strftime('%Y-%m-%d')
+        
+    def _process_tweet_batch(self):
         try:
-            # Create directory if it doesn't exist
-            os.makedirs('twitter_data', exist_ok=True)
+            # Find all tweets on the page
+            tweet_elements = self.driver.find_elements(By.CSS_SELECTOR, '[data-testid="tweet"]')
+            logger.info(f"Found {len(tweet_elements)} tweets on page")
             
-            # Generate filename with timestamp
+            # Process new tweets
+            tweets = []
+            for tweet in tweet_elements:
+                tweet_data = self.extract_tweet_data(tweet)
+                if tweet_data:
+                    tweets.append(tweet_data)
+                    self.tweets_scraped += 1
+                    logger.info(f"Processed tweet {len(tweets)}/{len(tweet_elements)}")
+                    
+            return tweets
+        except Exception as e:
+            logger.error(f"Error processing tweet batch: {str(e)}")
+            return []
+            
+    def _save_checkpoint(self, tweets):
+        try:
+            # Save tweets to CSV with proper structure
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            filename = f'twitter_data/{token_name}_{timestamp}.csv'
+            filename = f'twitter_data/checkpoint_{timestamp}.csv'
             
-            # Save to CSV
+            # Select and order columns
+            df = pd.DataFrame(tweets)
+            df = df[[
+                'timestamp',
+                'username',
+                'text', 
+                'likes',
+                'retweets',
+                'replies',
+                'raw_html'
+            ]]
+            
             df.to_csv(filename, index=False)
-            logger.info(f"Saved tweets to {filename}")
+            logger.info(f"Saved checkpoint to {filename}")
+        except Exception as e:
+            logger.error(f"Error saving checkpoint: {str(e)}")
             
+    def _evade_detection_scroll(self):
+        try:
+            # Scroll with dynamic wait
+            self.scroll_page(1)
+            logger.info("Scrolled page")
+        except Exception as e:
+            logger.error(f"Error evading detection: {str(e)}")
+            
+    def _handle_rate_limits(self):
+        if self.is_rate_limited():
+            wait_time = self.rate_limit_delay * (2 ** (self.tweets_scraped // 100))
+            wait_time = min(wait_time, 300)  # Cap at 5 minutes
+            logger.info(f"Rate limit detected. Waiting {wait_time:.2f} seconds")
+            time.sleep(wait_time)
+            return True
+        return False
+            
+    def _harvest_tweets(self, batch_size):
+        try:
+            # Find all tweets on the page
+            tweet_elements = self.driver.find_elements(By.CSS_SELECTOR, '[data-testid="tweet"]')
+            logger.info(f"Found {len(tweet_elements)} tweets on page")
+            
+            # Process new tweets
+            tweets = []
+            for tweet in tweet_elements[:batch_size]:
+                tweet_data = self.extract_tweet_data(tweet)
+                if tweet_data:
+                    tweets.append(tweet_data)
+                    self.tweets_scraped += 1
+                    logger.info(f"Processed tweet {len(tweets)}/{batch_size}")
+                    
+            return tweets
+        except Exception as e:
+            logger.error(f"Error harvesting tweets: {str(e)}")
+            return []
+            
+    def _smart_scroll(self):
+        try:
+            # Scroll with dynamic wait
+            self.scroll_page(1)
+            logger.info("Scrolled page")
+        except Exception as e:
+            logger.error(f"Error smart scrolling: {str(e)}")
+            
+    def _slow_down_scraping(self):
+        try:
+            # Slow down scraping
+            time.sleep(random.uniform(10, 30))
+            logger.info("Slowed down scraping")
+        except Exception as e:
+            logger.error(f"Error slowing down scraping: {str(e)}")
+            
+    def save_tweets(self, df, token_name):
+        """Save tweets to CSV with proper structure"""
+        try:
+            os.makedirs('twitter_data', exist_ok=True)
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f'twitter_data/scraped_tweets_{timestamp}.csv'
+            
+            # Select and order columns
+            df = df[[
+                'timestamp',
+                'username',
+                'text', 
+                'likes',
+                'retweets',
+                'replies',
+                'raw_html'
+            ]]
+            
+            df.to_csv(filename, index=False)
+            logger.info(f"Saved structured tweets to {filename}")
             return filename
+            
         except Exception as e:
             logger.error(f"Error saving tweets: {str(e)}")
             return None
+
+    def login_account(self):
+        """Log in to x.com using TWITTER_USERNAME_2 and TWITTER_PASSWORD_2 from environment variables."""
+        username = os.getenv("TWITTER_USERNAME_2")
+        password = os.getenv("TWITTER_PASSWORD_2")
+        if not username or not password:
+            logger.info("No login credentials provided; skipping login.")
+            return False
+        self.driver.get("https://x.com/login")
+        time.sleep(3)
+        try:
+            username_field = WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.NAME, "text"))
+            )
+            username_field.send_keys(username)
+            username_field.send_keys(Keys.RETURN)
+            time.sleep(3)
+            password_field = WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.NAME, "password"))
+            )
+            password_field.send_keys(password)
+            password_field.send_keys(Keys.RETURN)
+            time.sleep(5)
+            logger.info("Logged in successfully")
+            return True
+        except Exception as e:
+            logger.error(f"Login failed: {e}")
+            return False
+
+    def scrape_profile(self, search_username="aixbt_agent"):
+        """Log in (if credentials provided), navigate to https://x.com, search for the given username, click the profile, and scrape all tweets via infinite scrolling."""
+        # Attempt login if credentials are provided
+        username = os.getenv("TWITTER_USERNAME_2")
+        password = os.getenv("TWITTER_PASSWORD_2")
+        if username and password:
+            logged_in = self.login_account()
+            if not logged_in:
+                logger.error("Login failed; proceeding without login.")
+
+        try:
+            # Navigate to home page
+            self.driver.get("https://x.com")
+            time.sleep(random.uniform(3, 5))  
+
+            # Locate the search box with fallback if primary locator is not found
+            try:
+                search_box = WebDriverWait(self.driver, 10).until(
+                    EC.presence_of_element_located((By.XPATH, "//input[@placeholder='Search X']"))
+                )
+            except Exception as e:
+                logger.info("Primary search box locator not found, trying alternative locator.")
+                search_box = WebDriverWait(self.driver, 10).until(
+                    EC.presence_of_element_located((By.XPATH, "//input[contains(@aria-label, 'Search')]"))
+                )
+            search_box.clear()
+            search_box.send_keys(search_username)
+            search_box.send_keys(Keys.RETURN)
+            time.sleep(random.uniform(3, 5))  
+
+            # Click the profile link from search results
+            profile_link = WebDriverWait(self.driver, 10).until(
+                EC.element_to_be_clickable((By.XPATH, f"//a[contains(@href, '/{search_username}')]"))
+            )
+            profile_link.click()
+            time.sleep(random.uniform(3, 5))
+
+            # Infinite scroll loop with a fallback for "Show more" button and extended scroll attempts
+            last_height = self.driver.execute_script("return document.body.scrollHeight")
+            scroll_attempts = 0
+            max_scroll_attempts = 5
+            while scroll_attempts < max_scroll_attempts:
+                self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                time.sleep(random.uniform(2, 4))
+                new_height = self.driver.execute_script("return document.body.scrollHeight")
+                if new_height == last_height:
+                    try:
+                        show_more = self.driver.find_element(By.XPATH, "//span[text()='Show more']")
+                        if show_more.is_displayed():
+                            show_more.click()
+                            time.sleep(random.uniform(2, 4))
+                            new_height = self.driver.execute_script("return document.body.scrollHeight")
+                        else:
+                            scroll_attempts += 1
+                    except Exception as e:
+                        scroll_attempts += 1
+                else:
+                    scroll_attempts = 0
+                last_height = new_height
+
+            # Extract all tweet texts from the loaded page
+            tweets = self.driver.find_elements(By.XPATH, '//article')
+            tweet_texts = [tweet.text for tweet in tweets if tweet.text]
+            full_text = "\n\n".join(tweet_texts)
+            with open("aixbt_agent_full_tweets.txt", "w", encoding="utf-8") as f:
+                f.write(full_text)
+            logger.info(f"Scraped {len(tweet_texts)} tweets and saved to aixbt_agent_full_tweets.txt")
+            return full_text
+        except Exception as e:
+            logger.error(f"Error scraping profile: {str(e)}")
+            traceback.print_exc()
+            return ""
 
 def get_last_processed_token():
     """Get the last successfully processed token from the most recent data file"""
@@ -459,6 +606,13 @@ def get_token_list():
         return []
 
 def main():
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "profile":
+        profile_url = sys.argv[2] if len(sys.argv) > 2 else "https://x.com/aixbt_agent"
+        scraper = TwitterScraper()
+        scraper.scrape_profile(profile_url)
+        return
+
     # Initialize scraper
     scraper = TwitterScraper()
     
@@ -476,7 +630,7 @@ def main():
     # Initialize or load results DataFrame
     results_df = pd.DataFrame(columns=[
         'token', 'address', 'timestamp', 'tweet_text', 'username',
-        'likes', 'retweets', 'sentiment', 'is_meme', 'meme_relevance_score'
+        'likes', 'retweets', 'replies', 'sentiment', 'is_meme', 'meme_relevance_score'
     ])
     
     # Load existing results if available
@@ -511,8 +665,8 @@ def main():
             # Scrape tweets
             df = scraper.scrape_tweets(
                 query=token['query'],
-                days_back=1,
-                limit=200  # Increased limit for better sentiment analysis
+                days_back=365,
+                limit=50000
             )
             
             if not df.empty:
