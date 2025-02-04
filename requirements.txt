@@ -7,3 +7,10 @@ requests==2.31.0
 snscrape==0.7.0.20230622
 pandas==2.1.4
 textblob==0.17.1
+langchain==0.1.0
+langchain-core==0.1.10
+langchain-community==0.0.13
+langgraph==0.0.18
+pydantic==2.5.3
+apscheduler==3.10.4
+vader-sentiment==3.3.2
